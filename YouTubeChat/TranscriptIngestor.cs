@@ -20,18 +20,21 @@ public class TranscriptIngestor
         _transcriptItems = transcriptItems;
     }
 
-    public async Task RunAsync(IEnumerable<YoutubeTranscriptApi.TranscriptItem> transcript, string outputDir)
+    // Add the event
+    public event EventHandler<TranscriptChunk>? ChunkUpserted;
+
+    public async Task RunAsync(IEnumerable<YoutubeTranscriptApi.TranscriptItem> transcript)
     {
-        Console.WriteLine("Ingesting transcript...");
+        var lengthOfChunksInSeconds = 120;
+        var lengthPerTranscriptItem = 3;
+        var overlapOfChunksInSeconds = 3;
 
         // Load data
-        // var chunks = new List<TranscriptChunk>();
         var chunkIndex = 0;
 
         // Create embeddings for the full transcript
-        // There are about 3 seconds of audio per transcript item, so combine them into 30 second chunks
+        // There are about 3 seconds of audio per transcript item, so combine them into larger chunks (based on length defined earlier)
         var builder = new StringBuilder();
-        var endOfCurrentChunk = 10;
         float startTimeForChunk = 0;
         float durationForChunk = 0;
 
@@ -39,42 +42,43 @@ public class TranscriptIngestor
         {
             var element = transcript.ElementAt(i);
 
-            // Track the start time for the first item in this 30 second clip
-            if (i == (endOfCurrentChunk - 10))
-            {
-                startTimeForChunk = element.Start;
-            }
-            durationForChunk += element.Duration;
-
             // [1] Build up text to ingest
             builder.Append(element.Text);
             builder.Append(" "); // Account for transcripts not adding spacing between items
 
-            // When we have about 30 seconds of audio, ingest it
-            if (i == endOfCurrentChunk)
+            durationForChunk += element.Duration;
+
+            // Track the start time for the first item in this chunk
+            if (durationForChunk >= lengthOfChunksInSeconds)
             {
-                Console.WriteLine($"Writing chunk {chunkIndex}");
                 var text = builder.ToString();
 
                 // [2] Embed (string -> embedding)
                 var embedding = await _embeddingGenerator.GenerateEmbeddingVectorAsync(text);
 
-                // [3] Save
-                _transcriptItems.UpsertAsync(new TranscriptChunk
+                // Create the chunk object
+                var chunk = new TranscriptChunk
                 {
                     Id = ++chunkIndex,
                     StartTime = startTimeForChunk,
                     Duration = durationForChunk,
                     Text = text,
                     Embedding = embedding
-                });
+                };
+
+                // [3] Save the chunk
+                await _transcriptItems.UpsertAsync(chunk);
+
+                // Notify any listeners that a chunk has been upserted
+                ChunkUpserted?.Invoke(this, chunk);
 
                 builder.Clear();
 
-                // Ensure the chunks overlap by ~3 seconds
-                i -= 3;
-                endOfCurrentChunk = i + 10;
+                // Go back by 3 transcript items to make sure there's an overlap of text in each chunk
+                i -= overlapOfChunksInSeconds;
                 durationForChunk = 0;
+                element = transcript.ElementAt(i);
+                startTimeForChunk = element.Start;
             }
         }
     }
