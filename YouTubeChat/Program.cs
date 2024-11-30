@@ -1,24 +1,29 @@
 ﻿using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.AI;
-using OpenAI;
-using OllamaSharp;
-using YoutubeTranscriptApi;
-using Microsoft.SemanticKernel.Memory;
-using Microsoft.SemanticKernel.Connectors.InMemory;
 using Microsoft.Extensions.VectorData;
-using OpenAI.VectorStores;
+using Microsoft.SemanticKernel.Connectors.InMemory;
+using OllamaSharp;
+using OpenAI;
+using YoutubeTranscriptApi;
+
+var usingOpenAI = true;
+IChatClient chatClient = null;
+IEmbeddingGenerator<string, Embedding<float>> embeddingGenerator = null;
 
 // Setup the connection to OpenAI
-var ollamaEndpoint = "http://localhost:11434/";
-IChatClient client = new OllamaApiClient(ollamaEndpoint, "llama3.2");
-// IChatClient client = new OpenAIClient(Environment.GetEnvironmentVariable("OPENAI_API_KEY"))
-//     .AsChatClient("gpt-4o-mini");
-
-IEmbeddingGenerator<string, Embedding<float>> generator =
-    new OllamaApiClient(ollamaEndpoint, "all-minilm");
-// new OpenAIClient(Environment.GetEnvironmentVariable("OPENAI_API_KEY"))
-//     .AsEmbeddingGenerator("text-embedding-3-small");
+if (usingOpenAI)
+{
+    OpenAIClient client = new OpenAIClient(Environment.GetEnvironmentVariable("OPENAI_API_KEY"));
+    chatClient = client.AsChatClient("gpt-4o-mini");
+    embeddingGenerator = client.AsEmbeddingGenerator("text-embedding-3-small");
+}
+else
+{
+    var ollamaEndpoint = "http://localhost:11434/";
+    chatClient = new OllamaApiClient(ollamaEndpoint, "llama3.2");
+    embeddingGenerator = new OllamaApiClient(ollamaEndpoint, "all-minilm");
+}
 
 IEnumerable<YoutubeTranscriptApi.TranscriptItem> transcript = null;
 
@@ -28,7 +33,6 @@ if (File.Exists("transcript.json"))
 }
 else
 {
-
     var youtubeTranscriptApi = new YouTubeTranscriptApi();
 
     // https://www.youtube.com/watch?v=7Rw_ciSh2Wk
@@ -39,30 +43,42 @@ else
 }
 
 #pragma warning disable SKEXP0020 // Type is for evaluation purposes only and is subject to change or removal in future updates. Suppress this diagnostic to proceed.
-IVectorStoreRecordCollection<int, TranscriptChunk> transcriptItems;
+var vectorStore = new InMemoryVectorStore();
+IVectorStoreRecordCollection<int, TranscriptChunk> transcriptItems = 
+    vectorStore.GetCollection<int, TranscriptChunk>("transcriptItems");
+await transcriptItems.CreateCollectionIfNotExistsAsync();
 
-// if (File.Exists("data/transcript-chunks.json"))
-// {
-//     transcriptItems = JsonSerializer.Deserialize<IVectorStoreRecordCollection<int, TranscriptChunk>>(
-//         File.ReadAllText("data/transcript-chunks.json"));
-// }
-// else
-// {
-    var vectorStore = new InMemoryVectorStore();
-    transcriptItems = vectorStore.GetCollection<int, TranscriptChunk>("transcriptItems");
-    await transcriptItems.CreateCollectionIfNotExistsAsync();
+// Load the transcript chunks from disk, if they exist
+if (File.Exists(Path.Combine("data", "transcript-chunks.json")))
+{
+    List <TranscriptChunk> chunks = JsonSerializer.Deserialize<List<TranscriptChunk>>(
+         File.ReadAllText("data/transcript-chunks.json"));
+    foreach (var chunk in chunks)
+    {
+        await transcriptItems.UpsertAsync(chunk);
+    }
+}
+else
+{
+    TranscriptIngestor ingestor = new TranscriptIngestor(embeddingGenerator, transcriptItems);
 
-    TranscriptIngestor ingestor = new TranscriptIngestor(generator, transcriptItems);
-    await ingestor.RunAsync(transcript, "./data");
+    // Maintain a copy of the list of chunks, for serialization
+    List<TranscriptChunk> chunks = new List<TranscriptChunk>();
+    ingestor.ChunkUpserted += (object? sender, TranscriptChunk chunk) =>
+    {
+        Console.WriteLine($"Chunk upserted: {chunk}");
+        chunks.Add(chunk);
+    };
 
-    // var outputOptions = new JsonSerializerOptions { WriteIndented = true };
-    // await vectorStore.SerializeCollectionAsJsonAsync<int, TranscriptChunk>("transcriptItems",
-    //     File.Create("data/transcript-chunks.json"), outputOptions);
+    Console.WriteLine("Ingesting transcript...");
+    await ingestor.RunAsync(transcript);
+
+    // When finished, serialize the chunks to disk
+    var outputOptions = new JsonSerializerOptions { WriteIndented = true };
     
-    // var content = JsonSerializer.Serialize(vectorStore, outputOptions);
-    // await File.WriteAllTextAsync(Path.Combine("data", "transcript-chunks.json"), content);
-    Console.WriteLine($"Wrote transcript chunks");
-// }
+    var content = JsonSerializer.Serialize(chunks, outputOptions);
+    await File.WriteAllTextAsync(Path.Combine("data", "transcript-chunks.json"), content);
+}
 
 do
 {
@@ -73,8 +89,8 @@ do
         break;
     }
 
-    var queryEmbedding = await generator.GenerateEmbeddingVectorAsync(prompt);
-    
+    var queryEmbedding = await embeddingGenerator.GenerateEmbeddingVectorAsync(prompt);
+
     var searchOptions = new VectorSearchOptions()
     {
         Top = 3,
@@ -82,25 +98,37 @@ do
     };
 
     var results = await transcriptItems.VectorizedSearchAsync(queryEmbedding, searchOptions);
+    StringBuilder builder = new StringBuilder();
 
     await foreach (var result in results.Results)
     {
-        Console.WriteLine($"StartTime: {result.Record.StartTime}");
-        Console.WriteLine($"Duration: {result.Record.Duration}");
-        Console.WriteLine($"Text: {result.Record.Text}");
-        Console.WriteLine($"Score: {result.Score}");
-        Console.WriteLine();
+        // Console.WriteLine($"StartTime: {result.Record.StartTime}");
+        // Console.WriteLine($"Duration: {result.Record.Duration}");
+        // Console.WriteLine($"Text: {result.Record.Text}");
+        // Console.WriteLine($"Score: {result.Score}");
+        // Console.WriteLine();
+        builder.AppendLine(result.Record.Text);
     }
+
+    var systemPrompt = $@"You're an expert at developing software using .NET and Microsoft.Extensions.AI.
+                        When you answer questions from developers, you should provide detailed explanations and examples.
+                        You should also provide links to documentation and other resources that can help developers learn more.
+                        Use the context below to help answer questions, limit responses to use only the provided context.
+                        Respond in 4 paragraphs or less:
+                        
+                        <context>
+                        {builder.ToString()}
+                        </context>
+                        
+                        Question: {prompt}";
+    
+    Console.WriteLine("Ask a question, or type 'exit' to quit.");
+    Console.ForegroundColor = ConsoleColor.Green; // Set console text color to green
+    IAsyncEnumerable<StreamingChatCompletionUpdate> responseChunk = chatClient.CompleteStreamingAsync(systemPrompt);
+    await foreach (var update in responseChunk)
+    {
+        Console.Write(update.Text);
+    }
+    Console.WriteLine();
+    Console.ResetColor(); // Reset console text color to default
 } while (true);
-
-
-
-// // Create embeddings for the full transcript
-// // There are about 3 seconds of audio per transcript item, so combine them into 30 second chunks
-// for (var i = 0; i < transcript.Count(); i += 10)
-// {
-//     var chunk = transcript.Skip(i).Take(10);
-//     var embeddings = generator.Generate(chunk.Select(x => x.Text));
-//     var response = client.SendMessage(embeddings);
-//     Console.WriteLine(response);
-// }
