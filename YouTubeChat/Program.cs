@@ -3,20 +3,37 @@ using System.Text.Json;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.VectorData;
 using Microsoft.SemanticKernel.Connectors.InMemory;
+using Mscc.GenerativeAI.Microsoft;
 using OllamaSharp;
 using OpenAI;
 using YoutubeTranscriptApi;
 
+AppContext.SetSwitch("System.Net.SocketsHttpHandler.Http3Support", false);
+
 var usingOpenAI = true;
+var usingGemini = true;
 IChatClient chatClient = null;
 IEmbeddingGenerator<string, Embedding<float>> embeddingGenerator = null;
+
+var apiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY");
+if (apiKey is null) usingOpenAI = false;
+
+apiKey = Environment.GetEnvironmentVariable("GOOGLE_API_KEY");
+if (apiKey is null) usingGemini = false;
 
 // Setup the connection to OpenAI
 if (usingOpenAI)
 {
-    OpenAIClient client = new OpenAIClient(Environment.GetEnvironmentVariable("OPENAI_API_KEY"));
+    OpenAIClient client = new OpenAIClient(apiKey);
     chatClient = client.AsChatClient("gpt-4o-mini");
     embeddingGenerator = client.AsEmbeddingGenerator("text-embedding-3-small");
+}
+// Setup the connection to Gemini
+else if (usingGemini)
+{
+    chatClient = new GeminiChatClient(apiKey, 
+        Environment.GetEnvironmentVariable("GOOGLE_AI_MODEL") ?? "gemini-1.5-flash-latest");
+    embeddingGenerator = new GeminiEmbeddingGenerator(apiKey, "text-embedding-004");
 }
 else
 {
@@ -82,6 +99,7 @@ else
 
 do
 {
+    Console.WriteLine("Ask a question, or type 'exit' to quit.");
     string prompt = Console.ReadLine();
 
     if (prompt.Equals("exit", StringComparison.InvariantCultureIgnoreCase))
@@ -122,7 +140,6 @@ do
                         
                         Question: {prompt}";
     
-    Console.WriteLine("Ask a question, or type 'exit' to quit.");
     Console.ForegroundColor = ConsoleColor.Green; // Set console text color to green
     IAsyncEnumerable<StreamingChatCompletionUpdate> responseChunk = chatClient.CompleteStreamingAsync(systemPrompt);
     await foreach (var update in responseChunk)
